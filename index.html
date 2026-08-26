@@ -50,7 +50,10 @@
   .session-count{ font-family:var(--font-mono); font-size:11px; color:var(--text-dim); }
 
   .group-label{ font-family:var(--font-mono); font-size:11px; letter-spacing:1.5px; text-transform:uppercase; color:var(--text-dim); margin:20px 0 8px; display:flex; align-items:center; gap:8px; }
+  .group-label > span{ display:flex; align-items:center; gap:8px; min-width:0; }
   .group-label::after{ content:''; flex:1; height:1px; background:var(--line); }
+  .rest-btn{ border:1px solid var(--line); background:var(--surface); color:var(--text-muted); font-family:var(--font-mono); font-size:10px; letter-spacing:0; padding:5px 7px; border-radius:6px; white-space:nowrap; cursor:pointer; }
+  .rest-btn:disabled{ color:var(--good); border-color:var(--good); cursor:default; }
 
   .card{ background:var(--surface); border:1px solid var(--line); border-radius:var(--radius); padding:14px 14px 12px; margin-bottom:10px; }
   .card-top{ display:flex; justify-content:space-between; align-items:flex-start; gap:10px; margin-bottom:2px; }
@@ -75,6 +78,7 @@
 
   .save-bar{ position:sticky; bottom:0; padding:14px 0 6px; margin-top:10px; background:linear-gradient(to top, var(--bg) 60%, transparent); }
   .save-btn{ width:100%; border:none; border-radius:999px; padding:14px; font-weight:700; font-size:15px; cursor:pointer; color:#1b1b1a; letter-spacing:.3px; }
+  .save-btn:disabled{ opacity:.65; cursor:wait; }
   .clear-link{ display:block; text-align:center; margin-top:20px; color:var(--text-dim); font-size:12px; background:none; border:none; cursor:pointer; font-family:var(--font-body); }
 
   .hist-controls{ display:flex; gap:8px; margin-bottom:14px; }
@@ -87,6 +91,8 @@
   .log-reps{ font-family:var(--font-mono); color:var(--text-dim); font-size:12px; }
 
   .toast{ position:fixed; bottom:20px; left:50%; transform:translateX(-50%); background:var(--surface-2); border:1px solid var(--line); color:var(--text); padding:10px 18px; border-radius:999px; font-size:13px; opacity:0; pointer-events:none; transition:opacity .25s, transform .25s; z-index:20; max-width:90vw; text-align:center; }
+  .toast.good{ border-color:var(--good); color:var(--good); }
+  .toast.warn{ border-color:var(--warn); color:var(--warn); }
   .toast.show{ opacity:1; transform:translateX(-50%) translateY(-4px); }
 
   @media (max-width:380px){ .weight-input{ width:52px !important; } input[type="number"]{ width:42px; font-size:13px; } }

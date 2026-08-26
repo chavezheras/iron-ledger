@@ -20,7 +20,7 @@ const EXERCISES = [
   { id:'press', name:'Single-Arm OH Press', group:2, cue:'Ribs down, press over ear', sets:{pelagio:3,wanix:3}, repRange:[6,10], perSide:true },
   { id:'lunge', name:'Reverse Lunge', group:3, cue:'Back knee light tap, front heel down', sets:{pelagio:2,wanix:4}, repRange:[8,12], perSide:true, swap:true, swapTextPelagio:'Lighter — maintenance only', swapTextWanix:'Extra volume — your focus' },
   { id:'pushup', name:'Push-Up', group:3, cue:'Straight line, elbows ~45°', sets:{pelagio:4,wanix:2}, repRange:[8,15], perSide:false, swap:true, swapTextPelagio:'Extra volume — your focus', swapTextWanix:'Lighter — maintenance only' },
-  { id:'swing', name:'KB Swing (finisher)', group:4, cue:'Hips snap, arms are hooks — not a squat', sets:{pelagio:1,wanix:1}, repRange:[0,0], perSide:false, finisher:true }
+  { id:'swing', name:'2 × 2 min: Swings + Halos', group:4, cue:'Alternate swings, halos (around the world), swings, halos', sets:{pelagio:1,wanix:1}, repRange:[0,0], perSide:false, finisher:true, segmentLabels:['SWINGS','HALOS','SWINGS','HALOS'] }
 ];
 const GROUP_LABELS = { 1:'Squat + Row', 2:'Hinge + Press', 3:'Your emphasis slot', 4:'Conditioning finisher' };
 const PROFILES = {
@@ -28,10 +28,11 @@ const PROFILES = {
   wanix:   { name:'Wanix',   color:'var(--accent-wanix)',  hex:'#4a7a96' }
 };
 
-let ui = { profile:'pelagio', tab:'session', workingDate: todayISO(), historyEx: null };
+let ui = { profile:'pelagio', tab:'session', workingDate: todayISO(), historyEx: null, _saving:false };
 let sessionsCache = { pelagio: [], wanix: [] };
 let firestoreReady = false;
 let db = null;
+let restTimerId = null;
 
 function todayISO(){ return new Date().toISOString().slice(0,10); }
 
@@ -75,15 +76,17 @@ function loadQueue(){ try{ return JSON.parse(localStorage.getItem('sheetsRetryQu
 function saveQueue(q){ localStorage.setItem('sheetsRetryQueue', JSON.stringify(q)); }
 
 async function pushToSheets(payload){
-  if(!SHEETS_WEBHOOK_URL || SHEETS_WEBHOOK_URL.includes('REPLACE_ME')) return;
+  if(!SHEETS_WEBHOOK_URL || SHEETS_WEBHOOK_URL.includes('REPLACE_ME')) return true;
   try{
     await fetch(SHEETS_WEBHOOK_URL, {
       method:'POST', mode:'no-cors',
       headers:{ 'Content-Type':'text/plain;charset=utf-8' },
       body: JSON.stringify(payload)
     });
+    return true;
   }catch(e){
     const q = loadQueue(); q.push(payload); saveQueue(q);
+    return false;
   }
 }
 
@@ -97,6 +100,11 @@ async function flushSheetsQueue(){
 
 // ---------- Data helpers ----------
 function getSessions(profile){ return sessionsCache[profile] || []; }
+
+function getLatestWorkoutDate(profile){
+  const sessions = getSessions(profile);
+  return sessions.reduce((latest, session)=> session.date > latest ? session.date : latest, '');
+}
 
 function getLastEntry(profile, exId){
   const sessions = getSessions(profile);
@@ -134,6 +142,7 @@ function render(){
   let statusHtml = '';
   if(ui._status) statusHtml = ui._status;
   else if(pendingCount) statusHtml = `${pendingCount} sheet ${pendingCount===1?'entry':'entries'} waiting to sync`;
+  else statusHtml = 'New workout is being logged — enter your completed sets, then save once.';
 
   app.innerHTML = `
     ${renderHeader()}
@@ -179,21 +188,23 @@ function romanish(n){ return ['①','②','③','④'][n-1] || n; }
 function renderSession(){
   const profile = ui.profile;
   const sessions = getSessions(profile);
+  const latestWorkoutDate = getLatestWorkoutDate(profile);
   const workingDate = ui.workingDate || todayISO();
   const todaySession = sessions.find(s=>s.date===workingDate);
 
   let html = `
     <div class="day-header">
       <input type="date" class="date-field" id="dateField" value="${workingDate}">
-      <span class="session-count">${sessions.length} session${sessions.length===1?'':'s'} logged</span>
+      <span class="session-count">${sessions.length} session${sessions.length===1?'':'s'} logged<br>Latest workout: ${latestWorkoutDate || 'none yet'}</span>
     </div>`;
   [1,2,3,4].forEach(g=>{
-    html += `<div class="group-label">${romanish(g)} ${GROUP_LABELS[g]}</div>`;
+    const restButton = g < 4 ? `<button type="button" class="rest-btn" data-action="rest">Start 1:00 rest</button>` : '';
+    html += `<div class="group-label"><span>${romanish(g)} ${GROUP_LABELS[g]}</span>${restButton}</div>`;
     EXERCISES.filter(e=>e.group===g).forEach(ex=> html += exerciseCard(ex, profile, todaySession));
   });
   html += `
     <div class="save-bar">
-      <button class="save-btn" id="saveSessionBtn" style="background:${PROFILES[profile].color}">Save session</button>
+      <button class="save-btn" id="saveSessionBtn" ${ui._saving?'disabled':''} style="background:${PROFILES[profile].color}">${ui._saving?'Saving workout...':'Save workout'}</button>
     </div>
     <button class="clear-link" id="clearDataBtn">Clear ${PROFILES[profile].name}'s logged sessions</button>`;
   return html;
@@ -206,13 +217,15 @@ function exerciseCard(ex, profile, todaySession){
   const prefWeight = existing ? existing.weight : (lastEntry ? lastEntry.weight : '');
   const badge = progressionBadge(ex, lastEntry);
   const swapTag = ex.swap ? `<span class="swap-tag" style="background:${profile==='pelagio'?'var(--accent-pelagio-dim)':'var(--accent-wanix-dim)'};color:${PROFILES[profile].color}">${profile==='pelagio'?ex.swapTextPelagio:ex.swapTextWanix}</span>` : '';
-  const targetText = ex.finisher ? 'Target: ~5 min continuous' : `Target: ${ex.repRange[0]}–${ex.repRange[1]} reps${ex.perSide?'/side':''} × ${setsCount} sets`;
+  const targetText = ex.finisher ? 'Target: 4 × 2 min, alternating swings and halos' : `Target: ${ex.repRange[0]}–${ex.repRange[1]} reps${ex.perSide?'/side':''} × ${setsCount} sets`;
   const lastTimeText = lastEntry ? `Last time: ${lastEntry.reps.join(', ')} @ ${lastEntry.weight}kg` : 'No previous log yet';
 
   let repsHtml = '';
   if(ex.finisher){
-    const val = existing ? existing.reps[0] : '';
-    repsHtml = `<div class="set-col"><label>TOTAL REPS</label><input type="number" min="0" data-ex="${ex.id}" data-set="0" class="reps-input" value="${val||''}" style="width:64px"></div>`;
+    repsHtml = ex.segmentLabels.map((label, i)=>{
+      const val = existing ? existing.reps[i] : '';
+      return `<div class="set-col"><label>${label}<br>2 MIN</label><input type="number" min="0" data-ex="${ex.id}" data-set="${i}" class="reps-input" value="${val||''}" style="width:64px"></div>`;
+    }).join('');
   } else {
     for(let i=0;i<setsCount;i++){
       const val = existing ? existing.reps[i] : '';
@@ -304,9 +317,16 @@ function attachEvents(){
     };
   });
 
+  document.querySelectorAll('[data-action="rest"]').forEach(btn=>{
+    btn.textContent = restButtonText();
+    btn.disabled = Boolean(ui._restEndsAt);
+    btn.onclick = ()=>startRestTimer();
+  });
+
   const saveBtn = document.getElementById('saveSessionBtn');
   if(saveBtn){
     saveBtn.onclick = async ()=>{
+      if(ui._saving) return;
       if(!db){ setStatus('Add your Firebase config in app.js first', 'warn'); render(); return; }
       const profile = ui.profile;
       const date = (document.getElementById('dateField')||{}).value || todayISO();
@@ -318,15 +338,33 @@ function attachEvents(){
         const reps = Array.from(repsEls).map(el=>Number(el.value)||0);
         if(weight || reps.some(r=>r>0)) entries[ex.id] = { weight, reps };
       });
+      if(!Object.keys(entries).length){
+        setStatus('Nothing to save yet — enter at least one weight or rep count.', 'warn');
+        showToast('Enter a workout before saving', 'warn');
+        render();
+        return;
+      }
       const docId = `${profile}_${date}`;
       const payload = { profile, date, entries, updatedAt: firebase.firestore.FieldValue.serverTimestamp() };
+      ui._saving = true;
+      setStatus('Saving workout...', '');
+      render();
+      let sheetsSynced = false;
       try{
         await db.collection('sessions').doc(docId).set(payload);
-        showToast('Session saved');
+        sheetsSynced = await pushToSheets({ profile, date, entries });
+        if(navigator.onLine && sheetsSynced){
+          setStatus('Saved and synced!', 'good');
+          showToast('Saved and synced!', 'good');
+        }else{
+          setStatus('Saved offline — workout will sync when internet is available.', 'warn');
+          showToast('Saved offline — will sync later', 'warn');
+        }
       }catch(e){
-        showToast('Saved locally — will sync when online');
+        setStatus('Saved offline — workout will sync when internet is available.', 'warn');
+        showToast('Saved offline — will sync later', 'warn');
       }
-      pushToSheets({ profile, date, entries });
+      ui._saving = false;
       render();
     };
   }
@@ -351,9 +389,41 @@ function attachEvents(){
   }
 }
 
-function showToast(msg){
+function restButtonText(){
+  if(!ui._restEndsAt) return 'Start 1:00 rest';
+  const remaining = Math.max(0, Math.ceil((ui._restEndsAt-Date.now())/1000));
+  return `Rest ${String(Math.floor(remaining/60)).padStart(2,'0')}:${String(remaining%60).padStart(2,'0')}`;
+}
+
+function updateRestButtons(){
+  document.querySelectorAll('[data-action="rest"]').forEach(btn=>{
+    btn.textContent = restButtonText();
+    btn.disabled = Boolean(ui._restEndsAt);
+  });
+}
+
+function startRestTimer(){
+  if(ui._restEndsAt) return;
+  ui._restEndsAt = Date.now() + 60 * 1000;
+  updateRestButtons();
+  clearInterval(restTimerId);
+  restTimerId = setInterval(()=>{
+    if(Date.now() >= ui._restEndsAt){
+      ui._restEndsAt = 0;
+      clearInterval(restTimerId);
+      restTimerId = null;
+      updateRestButtons();
+      showToast('Rest complete', 'good');
+      return;
+    }
+    updateRestButtons();
+  }, 250);
+}
+
+function showToast(msg, cls){
   const t = document.getElementById('toast');
   t.textContent = msg;
+  t.className = `toast ${cls||''}`;
   t.classList.add('show');
   clearTimeout(showToast._timer);
   showToast._timer = setTimeout(()=>t.classList.remove('show'), 2200);

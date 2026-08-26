@@ -1,4 +1,4 @@
-const CACHE_NAME = 'iron-ledger-v1';
+const CACHE_NAME = 'iron-ledger-v5';
 
 const PRECACHE_URLS = [
   './',
