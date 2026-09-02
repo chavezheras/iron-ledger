@@ -1,12 +1,11 @@
-const CACHE_NAME = 'iron-ledger-v5';
+const CACHE_NAME = 'iron-ledger-v7';
 
 const PRECACHE_URLS = [
   './',
   './index.html',
   './manifest.json',
   './app.js',
-  './icon-192.png',
-  './icon-512.png',
+  './new_icon.png',
   'https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js',
   'https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js'
 ];

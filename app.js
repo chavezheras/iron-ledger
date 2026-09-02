@@ -20,12 +20,12 @@ const EXERCISES = [
   { id:'press', name:'Single-Arm OH Press', group:2, cue:'Ribs down, press over ear', sets:{pelagio:3,wanix:3}, repRange:[6,10], perSide:true },
   { id:'lunge', name:'Reverse Lunge', group:3, cue:'Back knee light tap, front heel down', sets:{pelagio:2,wanix:4}, repRange:[8,12], perSide:true, swap:true, swapTextPelagio:'Lighter — maintenance only', swapTextWanix:'Extra volume — your focus' },
   { id:'pushup', name:'Push-Up', group:3, cue:'Straight line, elbows ~45°', sets:{pelagio:4,wanix:2}, repRange:[8,15], perSide:false, swap:true, swapTextPelagio:'Extra volume — your focus', swapTextWanix:'Lighter — maintenance only' },
-  { id:'swing', name:'2 × 2 min: Swings + Halos', group:4, cue:'Alternate swings, halos (around the world), swings, halos', sets:{pelagio:1,wanix:1}, repRange:[0,0], perSide:false, finisher:true, segmentLabels:['SWINGS','HALOS','SWINGS','HALOS'] }
+  { id:'swing', name:'1 min: Swings + Halos', group:4, cue:'Alternate swings with halos (around the world) for one minute', sets:{pelagio:1,wanix:1}, repRange:[0,0], perSide:false, finisher:true, segmentLabels:['SWINGS + HALOS'] }
 ];
 const GROUP_LABELS = { 1:'Squat + Row', 2:'Hinge + Press', 3:'Your emphasis slot', 4:'Conditioning finisher' };
 const PROFILES = {
-  pelagio: { name:'Pelagio', color:'var(--accent-pelagio)', hex:'#c1613a' },
-  wanix:   { name:'Wanix',   color:'var(--accent-wanix)',  hex:'#4a7a96' }
+  pelagio: { name:'Pelagio', color:'var(--accent-pelagio)', hex:'#393D7E' },
+  wanix:   { name:'Wanix',   color:'var(--accent-wanix)',  hex:'#F05A7E' }
 };
 
 let ui = { profile:'pelagio', tab:'session', workingDate: todayISO(), historyEx: null, _saving:false };
@@ -57,7 +57,7 @@ function initFirebase(){
     sessionsCache = next;
     firestoreReady = true;
     setStatus(navigator.onLine ? '' : 'Offline — logging locally, will sync when back online', navigator.onLine ? '' : 'warn');
-    render();
+    if(!ui._sessionDirty) render();
   }, (err)=>{
     console.error(err);
     setStatus('Sync error — check your Firebase config', 'warn');
@@ -217,14 +217,14 @@ function exerciseCard(ex, profile, todaySession){
   const prefWeight = existing ? existing.weight : (lastEntry ? lastEntry.weight : '');
   const badge = progressionBadge(ex, lastEntry);
   const swapTag = ex.swap ? `<span class="swap-tag" style="background:${profile==='pelagio'?'var(--accent-pelagio-dim)':'var(--accent-wanix-dim)'};color:${PROFILES[profile].color}">${profile==='pelagio'?ex.swapTextPelagio:ex.swapTextWanix}</span>` : '';
-  const targetText = ex.finisher ? 'Target: 4 × 2 min, alternating swings and halos' : `Target: ${ex.repRange[0]}–${ex.repRange[1]} reps${ex.perSide?'/side':''} × ${setsCount} sets`;
+  const targetText = ex.finisher ? 'Target: 1 min total, alternating swings and halos' : `Target: ${ex.repRange[0]}–${ex.repRange[1]} reps${ex.perSide?'/side':''} × ${setsCount} sets`;
   const lastTimeText = lastEntry ? `Last time: ${lastEntry.reps.join(', ')} @ ${lastEntry.weight}kg` : 'No previous log yet';
 
   let repsHtml = '';
   if(ex.finisher){
     repsHtml = ex.segmentLabels.map((label, i)=>{
       const val = existing ? existing.reps[i] : '';
-      return `<div class="set-col"><label>${label}<br>2 MIN</label><input type="number" min="0" data-ex="${ex.id}" data-set="${i}" class="reps-input" value="${val||''}" style="width:64px"></div>`;
+      return `<div class="set-col"><label>${label}<br>1 MIN</label><input type="number" min="0" data-ex="${ex.id}" data-set="${i}" class="reps-input" value="${val||''}" style="width:64px"></div>`;
     }).join('');
   } else {
     for(let i=0;i<setsCount;i++){
@@ -312,9 +312,14 @@ function attachEvents(){
 
   document.querySelectorAll('.weight-input').forEach(inp=>{
     inp.oninput = ()=>{
+      ui._sessionDirty = true;
       const badge = document.getElementById('wbadge-'+inp.dataset.ex);
       if(badge){ badge.style.background = weightColor(Number(inp.value)); badge.textContent = inp.value || '–'; }
     };
+  });
+
+  document.querySelectorAll('.reps-input').forEach(inp=>{
+    inp.oninput = ()=>{ ui._sessionDirty = true; };
   });
 
   document.querySelectorAll('[data-action="rest"]').forEach(btn=>{
@@ -345,14 +350,19 @@ function attachEvents(){
         return;
       }
       const docId = `${profile}_${date}`;
-      const payload = { profile, date, entries, updatedAt: firebase.firestore.FieldValue.serverTimestamp() };
+      const existingSession = getSessions(profile).find(session=>session.date===date);
+      const mergedEntries = { ...(existingSession && existingSession.entries || {}), ...entries };
+      const payload = { profile, date, entries:mergedEntries, updatedAt: firebase.firestore.FieldValue.serverTimestamp() };
       ui._saving = true;
       setStatus('Saving workout...', '');
       render();
       let sheetsSynced = false;
       try{
-        await db.collection('sessions').doc(docId).set(payload);
-        sheetsSynced = await pushToSheets({ profile, date, entries });
+        const sessionRef = db.collection('sessions').doc(docId);
+        const mergedPayload = { profile, date, updatedAt: payload.updatedAt };
+        Object.keys(entries).forEach(exId=>{ mergedPayload[`entries.${exId}`] = entries[exId]; });
+        await sessionRef.set(mergedPayload, { merge:true });
+        sheetsSynced = await pushToSheets({ profile, date, entries:mergedEntries });
         if(navigator.onLine && sheetsSynced){
           setStatus('Saved and synced!', 'good');
           showToast('Saved and synced!', 'good');
@@ -365,6 +375,7 @@ function attachEvents(){
         showToast('Saved offline — will sync later', 'warn');
       }
       ui._saving = false;
+      ui._sessionDirty = false;
       render();
     };
   }
