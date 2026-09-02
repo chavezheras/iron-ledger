@@ -51,6 +51,12 @@ function initFirebase(){
   firebase.initializeApp(firebaseConfig);
   db = firebase.firestore();
   auth = firebase.auth();
+  // Complete any pending redirect sign-in (used as a popup fallback) and
+  // surface errors instead of silently bouncing back to the sign-in screen.
+  auth.getRedirectResult().catch((err)=>{
+    setStatus(`Sign-in failed: ${err.message}`, 'warn');
+    render();
+  });
   auth.onAuthStateChanged((user)=>{
     currentUser = user;
     authReady = true;
@@ -89,12 +95,29 @@ function isAllowedUser(user){
   return !ALLOWED_EMAILS.length || ALLOWED_EMAILS.map(email=>email.toLowerCase()).includes((user.email||'').toLowerCase());
 }
 
-function signIn(){
+async function signIn(){
   const provider = new firebase.auth.GoogleAuthProvider();
-  auth.signInWithRedirect(provider).catch((err)=>{
+  provider.setCustomParameters({ prompt: 'select_account' });
+  // Popup keeps the OAuth hand-off on Firebase's own authDomain, so it works
+  // when the app is hosted on a different domain (GitHub Pages). signInWithRedirect
+  // breaks there because modern browsers partition cross-domain storage.
+  try{
+    await auth.signInWithPopup(provider);
+  }catch(err){
+    if(err.code === 'auth/popup-closed-by-user' || err.code === 'auth/cancelled-popup-request'){
+      return;
+    }
+    if(err.code === 'auth/popup-blocked' || err.code === 'auth/operation-not-supported-in-this-environment'){
+      // Rare environments with no popup support — fall back to redirect.
+      auth.signInWithRedirect(provider).catch((e)=>{
+        setStatus(`Sign-in failed: ${e.message}`, 'warn');
+        render();
+      });
+      return;
+    }
     setStatus(`Sign-in failed: ${err.message}`, 'warn');
     render();
-  });
+  }
 }
 
 function signOut(){ auth.signOut(); }
@@ -263,8 +286,7 @@ function renderSession(){
 
   let html = `
     <div class="day-header">
-      <input type="date" class="date-field" id="dateField" value="${workingDate}">
-        <input type="date" class="date-field" id="dateField" value="${escapeHTML(workingDate)}">
+      <input type="date" class="date-field" id="dateField" value="${escapeHTML(workingDate)}">
       <span class="session-count">${sessions.length} session${sessions.length===1?'':'s'} logged<br>Latest workout: ${escapeHTML(latestWorkoutDate || 'none yet')}</span>
     </div>`;
   [1,2,3,4].forEach(g=>{
