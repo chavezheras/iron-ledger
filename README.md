@@ -26,6 +26,7 @@ Iron Ledger is a small offline-first progressive web app for logging kettlebell 
 | `sw.js` | Offline app-shell cache and cache versioning |
 | `sheets-export.gs` | Reference Apps Script for mirroring sessions to Google Sheets |
 | `firestore.rules` | Firestore rules requiring authenticated users and valid session data |
+| `firebase.json` | Firebase CLI configuration for deploying Firestore rules |
 | `new_icon.png` | Current PWA and home-screen icon |
 
 ## Local Development
