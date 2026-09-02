@@ -4,7 +4,7 @@ Iron Ledger is a small offline-first progressive web app for logging kettlebell 
 
 ## Features
 
-- Separate workout profiles for two people (no account creation)
+- Separate workout profiles for two people behind Google sign-in
 - Date-based workout sessions
 - Exercise weights and reps tracking (fixed 5 month programme)
 - Latest workout date in the session view
@@ -25,6 +25,7 @@ Iron Ledger is a small offline-first progressive web app for logging kettlebell 
 | `manifest.json` | PWA metadata and install icon configuration |
 | `sw.js` | Offline app-shell cache and cache versioning |
 | `sheets-export.gs` | Reference Apps Script for mirroring sessions to Google Sheets |
+| `firestore.rules` | Firestore rules requiring authenticated users and valid session data |
 | `new_icon.png` | Current PWA and home-screen icon |
 
 ## Local Development
@@ -66,6 +67,8 @@ Every save is also sent to the configured Apps Script webhook. If the Sheets req
 
 The Firebase client configuration and Sheets webhook URL are stored in `app.js`. The Apps Script reference in `sheets-export.gs` must be pasted into the Google Sheet's Apps Script editor when setting up a new deployment.
 
+Google sign-in must be enabled in Firebase Authentication. Access is restricted to the two approved Google email addresses in `ALLOWED_EMAILS` and `firestore.rules`.
+
 ## Version History
 
 | Version | Status | Changes |
@@ -76,6 +79,7 @@ The Firebase client configuration and Sheets webhook URL are stored in `app.js`.
 | `0.4.0` | Released | Added one-minute rest timers between strength supersets. |
 | `0.5.0` | Released | Reduced the finisher to one minute, changed Pelagio to blue `#393D7E`, changed Wanix to pink `#F05A7E`, improved mobile readability, and added the new icon. |
 | `0.6.0` | Released | Prevented remote saves from clearing active workout forms and preserved existing exercise entries during partial saves. |
+| `0.7.0` | In progress | Added Google sign-in, client and Apps Script validation, save throttling, safe rendering, and progress-to-ceiling cards in History. |
 
 ## License
 
@@ -83,4 +87,4 @@ This repository is a private household training tool. No license is currently sp
 
 ## Security Note
 
-This app currently has no login and its Firestore collection is publicly readable and writable by design. Do not store sensitive health or personal information in it. The Firebase client configuration is public browser configuration, not a secret; the access rules and Apps Script webhook are the important security boundaries.
+The app requires Google sign-in, and Firestore rules restrict access to the two approved Google accounts. Deploy both the app and `firestore.rules` before storing sensitive health or personal information. The Firebase client configuration is public browser configuration, not a secret; the access rules and Apps Script webhook are the important security boundaries.

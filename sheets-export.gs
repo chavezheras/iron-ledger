@@ -20,9 +20,46 @@ var COLUMNS = [
 ];
 
 var EXERCISE_ORDER = ['squat', 'row', 'deadlift', 'press', 'lunge', 'pushup', 'swing'];
+var MAX_REQUESTS_PER_MINUTE = 30;
+
+function jsonResponse(body) {
+  return ContentService.createTextOutput(JSON.stringify(body))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+function validPayload(body) {
+  if (!body || ['pelagio', 'wanix'].indexOf(body.profile) === -1
+      || !/^\d{4}-\d{2}-\d{2}$/.test(body.date || '')
+      || !body.entries || typeof body.entries !== 'object') return false;
+  var ids = Object.keys(body.entries);
+  if (ids.length > EXERCISE_ORDER.length) return false;
+  for (var i = 0; i < ids.length; i++) {
+    if (EXERCISE_ORDER.indexOf(ids[i]) === -1) return false;
+    var entry = body.entries[ids[i]];
+    if (!entry || typeof entry.weight !== 'number' || entry.weight < 0 || entry.weight > 200
+        || !Array.isArray(entry.reps) || entry.reps.length > 10) return false;
+    for (var j = 0; j < entry.reps.length; j++) {
+      if (typeof entry.reps[j] !== 'number' || entry.reps[j] < 0 || entry.reps[j] > 500) return false;
+    }
+  }
+  return true;
+}
 
 function doPost(e) {
-  var body = JSON.parse(e.postData.contents);
+  var body;
+  try {
+    body = JSON.parse(e.postData.contents);
+  } catch (error) {
+    return jsonResponse({ ok: false, error: 'Invalid JSON' });
+  }
+  if (!validPayload(body)) return jsonResponse({ ok: false, error: 'Invalid workout payload' });
+
+  var cache = CacheService.getScriptCache();
+  var rateKey = 'iron-ledger-rate-window';
+  var rate = JSON.parse(cache.get(rateKey) || '{"count":0}');
+  if (rate.count >= MAX_REQUESTS_PER_MINUTE) return jsonResponse({ ok: false, error: 'Rate limit exceeded' });
+  cache.put(rateKey, JSON.stringify({ count: rate.count + 1 }), 60);
+
   var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('Log')
     || SpreadsheetApp.getActiveSpreadsheet().insertSheet('Log');
 
@@ -51,8 +88,7 @@ function doPost(e) {
     sheet.appendRow(row);
   }
 
-  return ContentService.createTextOutput(JSON.stringify({ ok: true }))
-    .setMimeType(ContentService.MimeType.JSON);
+  return jsonResponse({ ok: true });
 }
 
 function doGet(e) {

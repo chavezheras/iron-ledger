@@ -1,0 +1,26 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /sessions/{sessionId} {
+      allow read: if signedIn();
+      allow delete: if signedIn();
+      allow create, update: if signedIn() && validSession();
+    }
+
+    function signedIn() {
+      return request.auth != null
+        && request.auth.token.email in [
+          'chavezheras@gmail.com',
+          'aramayo.pilar@gmail.com'
+        ];
+    }
+
+    function validSession() {
+      return request.resource.data.profile in ['pelagio', 'wanix']
+        && request.resource.data.date is string
+        && request.resource.data.date.matches('^\\d{4}-\\d{2}-\\d{2}$')
+        && request.resource.data.entries is map;
+    }
+  }
+}

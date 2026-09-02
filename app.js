@@ -11,6 +11,8 @@ const firebaseConfig = {
 };
 // Paste the Apps Script Web App URL here once deployed (see sheets-export.gs):
 const SHEETS_WEBHOOK_URL = "https://script.google.com/macros/s/AKfycbxlrlRSo06VNDyBSTNmMMJUQGIv0gvycIBZrrw6LHyKCDAtW_HZ9E6DxyH5SaqpywGZdg/exec";
+const ALLOWED_EMAILS = ['chavezheras@gmail.com', 'aramayo.pilar@gmail.com'];
+const SAVE_LIMIT = { count: 3, windowMs: 10 * 60 * 1000 };
 // ============================================================
 
 const EXERCISES = [
@@ -32,6 +34,9 @@ let ui = { profile:'pelagio', tab:'session', workingDate: todayISO(), historyEx:
 let sessionsCache = { pelagio: [], wanix: [] };
 let firestoreReady = false;
 let db = null;
+let auth = null;
+let authReady = false;
+let currentUser = null;
 let restTimerId = null;
 
 function todayISO(){ return new Date().toISOString().slice(0,10); }
@@ -45,6 +50,22 @@ function initFirebase(){
   }
   firebase.initializeApp(firebaseConfig);
   db = firebase.firestore();
+  auth = firebase.auth();
+  auth.onAuthStateChanged((user)=>{
+    currentUser = user;
+    authReady = true;
+    if(user && !isAllowedUser(user)){
+      setStatus('This Google account is not authorised for Iron Ledger.', 'warn');
+      render();
+      return;
+    }
+    if(user) startSessionListener();
+    render();
+  });
+  render();
+}
+
+function startSessionListener(){
   db.enablePersistence({ synchronizeTabs: true }).catch((err)=>{
     console.warn('Offline persistence not enabled:', err.code);
   });
@@ -62,6 +83,44 @@ function initFirebase(){
     console.error(err);
     setStatus('Sync error — check your Firebase config', 'warn');
   });
+}
+
+function isAllowedUser(user){
+  return !ALLOWED_EMAILS.length || ALLOWED_EMAILS.map(email=>email.toLowerCase()).includes((user.email||'').toLowerCase());
+}
+
+function signIn(){
+  const provider = new firebase.auth.GoogleAuthProvider();
+  auth.signInWithRedirect(provider).catch((err)=>{
+    setStatus(`Sign-in failed: ${err.message}`, 'warn');
+    render();
+  });
+}
+
+function signOut(){ auth.signOut(); }
+
+function escapeHTML(value){
+  return String(value ?? '').replace(/[&<>"']/g, char=>({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[char]));
+}
+
+function isValidDate(value){ return /^\d{4}-\d{2}-\d{2}$/.test(value) && !Number.isNaN(Date.parse(`${value}T00:00:00Z`)); }
+
+function validNumber(value, min, max){
+  return Number.isFinite(value) && value >= min && value <= max;
+}
+
+function canSave(){
+  const now = Date.now();
+  let attempts = [];
+  try { attempts = JSON.parse(localStorage.getItem('saveAttempts')||'[]'); } catch (error) { attempts = []; }
+  const recent = Array.isArray(attempts) ? attempts.filter(time=>now-time<SAVE_LIMIT.windowMs) : [];
+  if(recent.length >= SAVE_LIMIT.count){
+    setStatus('Save limit reached — please wait a few minutes before saving again.', 'warn');
+    return false;
+  }
+  recent.push(now);
+  localStorage.setItem('saveAttempts', JSON.stringify(recent));
+  return true;
 }
 
 function setStatus(msg, cls){
@@ -135,12 +194,21 @@ function weightColor(w){
 // ---------- Render ----------
 function render(){
   const app = document.getElementById('app');
+  if(!authReady){
+    app.innerHTML = '<main class="auth-panel"><h1>Iron Ledger</h1><p>Connecting securely...</p></main>';
+    return;
+  }
+  if(!currentUser || !isAllowedUser(currentUser)){
+    app.innerHTML = `<main class="auth-panel"><h1>Iron Ledger</h1><p>Sign in with Google to access your workouts.</p><button class="auth-btn" id="signInBtn">Sign in with Google</button>${ui._status?`<div class="status-line warn">${escapeHTML(ui._status)}</div>`:''}</main>`;
+    attachEvents();
+    return;
+  }
   const profile = ui.profile;
   app.style.setProperty('--current-accent', PROFILES[profile].color);
 
   const pendingCount = loadQueue().length;
   let statusHtml = '';
-  if(ui._status) statusHtml = ui._status;
+  if(ui._status) statusHtml = escapeHTML(ui._status);
   else if(pendingCount) statusHtml = `${pendingCount} sheet ${pendingCount===1?'entry':'entries'} waiting to sync`;
   else statusHtml = 'New workout is being logged — enter your completed sets, then save once.';
 
@@ -172,6 +240,7 @@ function renderHeader(){
       <button data-action="profile" data-profile="pelagio" class="${ui.profile==='pelagio'?'active-pelagio':''}">Pelagio</button>
       <button data-action="profile" data-profile="wanix" class="${ui.profile==='wanix'?'active-wanix':''}">Wanix</button>
     </div>
+    <button class="sign-out-btn" id="signOutBtn" title="Sign out">Sign out</button>
   </header>`;
 }
 
@@ -195,7 +264,8 @@ function renderSession(){
   let html = `
     <div class="day-header">
       <input type="date" class="date-field" id="dateField" value="${workingDate}">
-      <span class="session-count">${sessions.length} session${sessions.length===1?'':'s'} logged<br>Latest workout: ${latestWorkoutDate || 'none yet'}</span>
+        <input type="date" class="date-field" id="dateField" value="${escapeHTML(workingDate)}">
+      <span class="session-count">${sessions.length} session${sessions.length===1?'':'s'} logged<br>Latest workout: ${escapeHTML(latestWorkoutDate || 'none yet')}</span>
     </div>`;
   [1,2,3,4].forEach(g=>{
     const restButton = g < 4 ? `<button type="button" class="rest-btn" data-action="rest">Start 1:00 rest</button>` : '';
@@ -214,22 +284,23 @@ function exerciseCard(ex, profile, todaySession){
   const setsCount = ex.sets[profile];
   const lastEntry = getLastEntry(profile, ex.id);
   const existing = todaySession && todaySession.entries ? todaySession.entries[ex.id] : null;
-  const prefWeight = existing ? existing.weight : (lastEntry ? lastEntry.weight : '');
+  const prefWeight = existing ? Number(existing.weight)||0 : (lastEntry ? Number(lastEntry.weight)||0 : '');
   const badge = progressionBadge(ex, lastEntry);
   const swapTag = ex.swap ? `<span class="swap-tag" style="background:${profile==='pelagio'?'var(--accent-pelagio-dim)':'var(--accent-wanix-dim)'};color:${PROFILES[profile].color}">${profile==='pelagio'?ex.swapTextPelagio:ex.swapTextWanix}</span>` : '';
   const targetText = ex.finisher ? 'Target: 1 min total, alternating swings and halos' : `Target: ${ex.repRange[0]}–${ex.repRange[1]} reps${ex.perSide?'/side':''} × ${setsCount} sets`;
-  const lastTimeText = lastEntry ? `Last time: ${lastEntry.reps.join(', ')} @ ${lastEntry.weight}kg` : 'No previous log yet';
+  const lastReps = Array.isArray(lastEntry && lastEntry.reps) ? lastEntry.reps : [];
+  const lastTimeText = lastEntry ? `Last time: ${escapeHTML(lastReps.map(rep=>Number(rep)||0).join(', '))} @ ${escapeHTML(Number(lastEntry.weight)||0)}kg` : 'No previous log yet';
 
   let repsHtml = '';
   if(ex.finisher){
     repsHtml = ex.segmentLabels.map((label, i)=>{
-      const val = existing ? existing.reps[i] : '';
-      return `<div class="set-col"><label>${label}<br>1 MIN</label><input type="number" min="0" data-ex="${ex.id}" data-set="${i}" class="reps-input" value="${val||''}" style="width:64px"></div>`;
+      const val = existing ? Number(existing.reps[i])||0 : '';
+      return `<div class="set-col"><label>${escapeHTML(label)}<br>1 MIN</label><input type="number" min="0" data-ex="${ex.id}" data-set="${i}" class="reps-input" value="${escapeHTML(val||'')}" style="width:64px"></div>`;
     }).join('');
   } else {
     for(let i=0;i<setsCount;i++){
-      const val = existing ? existing.reps[i] : '';
-      repsHtml += `<div class="set-col"><label>SET ${i+1}</label><input type="number" min="0" data-ex="${ex.id}" data-set="${i}" class="reps-input" value="${val!==undefined&&val!==null?val:''}"></div>`;
+      const val = existing ? Number(existing.reps[i])||0 : '';
+      repsHtml += `<div class="set-col"><label>SET ${i+1}</label><input type="number" min="0" data-ex="${ex.id}" data-set="${i}" class="reps-input" value="${escapeHTML(val||'')}"></div>`;
     }
   }
   const w = prefWeight || 0;
@@ -247,7 +318,7 @@ function exerciseCard(ex, profile, todaySession){
     <div class="input-row">
       <div class="weight-wrap">
         <div class="weight-badge" id="wbadge-${ex.id}" style="background:${weightColor(Number(w))}">${w||'–'}</div>
-        <input type="number" min="0" step="0.5" class="weight-input" data-ex="${ex.id}" id="weight-${ex.id}" value="${prefWeight||''}" placeholder="kg">
+        <input type="number" min="0" step="0.5" class="weight-input" data-ex="${ex.id}" id="weight-${ex.id}" value="${escapeHTML(prefWeight||'')}" placeholder="kg">
       </div>
       <div class="reps-group">${repsHtml}</div>
     </div>
@@ -262,24 +333,41 @@ function renderHistory(){
   const points = [];
   sessions.forEach(s=>{
     const entry = s.entries && s.entries[chartEx];
-    if(entry && entry.weight) points.push({ date:s.date, weight:Number(entry.weight), reps:entry.reps });
+    const weight = Number(entry && entry.weight);
+    if(Number.isFinite(weight) && weight > 0) points.push({ date:s.date, weight, reps:entry.reps });
   });
   const chartHtml = points.length < 2
     ? `<div class="chart-empty">Log at least 2 sessions with weight for this exercise to see a trend line.</div>`
     : svgChart(points, profile);
 
+  const progressHtml = EXERCISES.filter(ex=>!ex.finisher).map(ex=>progressCard(ex, getLastEntry(profile, ex.id))).join('');
+
   let logRows = '';
   sessions.slice().reverse().slice(0,10).forEach(s=>{
     const entry = s.entries && s.entries[chartEx];
     if(!entry) return;
-    logRows += `<div class="log-row"><span class="log-date">${s.date}</span><span class="log-reps">${entry.weight}kg — ${entry.reps.join(', ')}</span></div>`;
+    const reps = (Array.isArray(entry.reps) ? entry.reps : []).map(rep=>Number(rep)||0).join(', ');
+    logRows += `<div class="log-row"><span class="log-date">${escapeHTML(s.date)}</span><span class="log-reps">${escapeHTML(Number(entry.weight)||0)}kg — ${escapeHTML(reps)}</span></div>`;
   });
   if(!logRows) logRows = `<div class="chart-empty">No entries yet for this exercise.</div>`;
 
   return `
     <div class="hist-controls"><select id="historyExSelect">${options}</select></div>
+    <div class="progress-grid">${progressHtml}</div>
     <div class="chart-card">${chartHtml}</div>
     <div class="chart-card">${logRows}</div>`;
+}
+
+function progressCard(ex, lastEntry){
+  if(!lastEntry || !Array.isArray(lastEntry.reps) || !lastEntry.reps.length){
+    return `<div class="progress-card"><strong>${escapeHTML(ex.name)}</strong><span>No log yet</span></div>`;
+  }
+  const top = ex.repRange[1];
+  const minReps = Math.min(...lastEntry.reps.map(rep=>Number(rep)||0));
+  const percent = Math.min(100, Math.round((minReps/top)*100));
+  const ready = minReps >= top;
+  const label = ready ? 'Ready to increase weight' : `${top-minReps} reps to ceiling`;
+  return `<div class="progress-card"><div class="progress-top"><strong>${escapeHTML(ex.name)}</strong><span>${escapeHTML(Number(lastEntry.weight)||0)} kg</span></div><div class="progress-track"><div class="progress-fill" style="width:${percent}%"></div></div><span class="progress-label">${escapeHTML(label)}</span></div>`;
 }
 
 function svgChart(points, profile){
@@ -332,17 +420,29 @@ function attachEvents(){
   if(saveBtn){
     saveBtn.onclick = async ()=>{
       if(ui._saving) return;
-      if(!db){ setStatus('Add your Firebase config in app.js first', 'warn'); render(); return; }
+      if(!db || !currentUser){ setStatus('Sign in before saving a workout.', 'warn'); render(); return; }
+      if(!canSave()) { render(); return; }
       const profile = ui.profile;
       const date = (document.getElementById('dateField')||{}).value || todayISO();
+      if(!isValidDate(date)){ setStatus('Choose a valid workout date.', 'warn'); render(); return; }
       const entries = {};
+      let invalidEntry = false;
       EXERCISES.forEach(ex=>{
         const weightEl = document.getElementById('weight-'+ex.id);
         const weight = weightEl ? Number(weightEl.value)||0 : 0;
         const repsEls = document.querySelectorAll(`.reps-input[data-ex="${ex.id}"]`);
         const reps = Array.from(repsEls).map(el=>Number(el.value)||0);
+        if(!validNumber(weight, 0, 200) || reps.length > 10 || reps.some(rep=>!validNumber(rep, 0, 500))){
+          invalidEntry = true;
+          return;
+        }
         if(weight || reps.some(r=>r>0)) entries[ex.id] = { weight, reps };
       });
+      if(invalidEntry){
+        setStatus('Use weights from 0–200 kg and reps from 0–500.', 'warn');
+        render();
+        return;
+      }
       if(!Object.keys(entries).length){
         setStatus('Nothing to save yet — enter at least one weight or rep count.', 'warn');
         showToast('Enter a workout before saving', 'warn');
@@ -392,6 +492,11 @@ function attachEvents(){
       showToast('Cleared');
     };
   }
+
+  const signInBtn = document.getElementById('signInBtn');
+  if(signInBtn) signInBtn.onclick = signIn;
+  const signOutBtn = document.getElementById('signOutBtn');
+  if(signOutBtn) signOutBtn.onclick = signOut;
 
   const historySelect = document.getElementById('historyExSelect');
   if(historySelect){
