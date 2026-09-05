@@ -51,6 +51,11 @@ function initFirebase(){
   firebase.initializeApp(firebaseConfig);
   db = firebase.firestore();
   auth = firebase.auth();
+  // Keep the session (and its refresh token) in IndexedDB — the default, but
+  // being explicit avoids Safari standalone-PWA quirks after popup sign-in.
+  auth.setPersistence(firebase.auth.Auth.Persistence.LOCAL).catch((err)=>{
+    console.warn('Could not set local auth persistence:', err.code || err.message);
+  });
   // Complete any pending redirect sign-in (used as a popup fallback) and
   // surface errors instead of silently bouncing back to the sign-in screen.
   auth.getRedirectResult().catch((err)=>{
@@ -132,18 +137,27 @@ function validNumber(value, min, max){
   return Number.isFinite(value) && value >= min && value <= max;
 }
 
-function canSave(){
+function recentSaveTimes(){
   const now = Date.now();
   let attempts = [];
   try { attempts = JSON.parse(localStorage.getItem('saveAttempts')||'[]'); } catch (error) { attempts = []; }
-  const recent = Array.isArray(attempts) ? attempts.filter(time=>now-time<SAVE_LIMIT.windowMs) : [];
-  if(recent.length >= SAVE_LIMIT.count){
+  return (Array.isArray(attempts) ? attempts : []).filter(time=>now-time<SAVE_LIMIT.windowMs);
+}
+
+// Only a genuine, completed save counts toward the throttle — failed attempts
+// must not lock the user out while they retry.
+function canSave(){
+  if(recentSaveTimes().length >= SAVE_LIMIT.count){
     setStatus('Save limit reached — please wait a few minutes before saving again.', 'warn');
     return false;
   }
-  recent.push(now);
-  localStorage.setItem('saveAttempts', JSON.stringify(recent));
   return true;
+}
+
+function recordSave(){
+  const recent = recentSaveTimes();
+  recent.push(Date.now());
+  localStorage.setItem('saveAttempts', JSON.stringify(recent));
 }
 
 function setStatus(msg, cls){
@@ -474,30 +488,53 @@ function attachEvents(){
       const docId = `${profile}_${date}`;
       const existingSession = getSessions(profile).find(session=>session.date===date);
       const mergedEntries = { ...(existingSession && existingSession.entries || {}), ...entries };
-      const payload = { profile, date, entries:mergedEntries, updatedAt: firebase.firestore.FieldValue.serverTimestamp() };
+      const mergedPayload = { profile, date, updatedAt: firebase.firestore.FieldValue.serverTimestamp() };
+      Object.keys(entries).forEach(exId=>{ mergedPayload[`entries.${exId}`] = entries[exId]; });
+      const writeSession = ()=> db.collection('sessions').doc(docId).set(mergedPayload, { merge:true });
+
       ui._saving = true;
       setStatus('Saving workout...', '');
       render();
-      let sheetsSynced = false;
+
       try{
-        const sessionRef = db.collection('sessions').doc(docId);
-        const mergedPayload = { profile, date, updatedAt: payload.updatedAt };
-        Object.keys(entries).forEach(exId=>{ mergedPayload[`entries.${exId}`] = entries[exId]; });
-        await sessionRef.set(mergedPayload, { merge:true });
-        sheetsSynced = await pushToSheets({ profile, date, entries:mergedEntries });
-        if(navigator.onLine && sheetsSynced){
+        // set() only rejects on a real error — offline writes resolve from cache
+        // and sync later. So a rejection here means the write genuinely failed.
+        try{
+          await writeSession();
+        }catch(err){
+          if((err.code === 'permission-denied' || err.code === 'unauthenticated') && currentUser){
+            // Stale ID token — common right after popup sign-in. Refresh and retry once.
+            await currentUser.getIdToken(true);
+            await writeSession();
+          }else{
+            throw err;
+          }
+        }
+        recordSave();
+        ui._sessionDirty = false;
+        const sheetsSynced = await pushToSheets({ profile, date, entries:mergedEntries });
+        if(sheetsSynced){
           setStatus('Saved and synced!', 'good');
           showToast('Saved and synced!', 'good');
-        }else{
+        }else if(!navigator.onLine){
           setStatus('Saved offline — workout will sync when internet is available.', 'warn');
           showToast('Saved offline — will sync later', 'warn');
+        }else{
+          setStatus('Saved to the database — the Sheet copy will retry shortly.', 'good');
+          showToast('Saved — Sheet copy pending', 'good');
         }
-      }catch(e){
-        setStatus('Saved offline — workout will sync when internet is available.', 'warn');
-        showToast('Saved offline — will sync later', 'warn');
+      }catch(err){
+        console.error('Workout save failed:', err);
+        const detail = (err && (err.code || err.message)) || 'unknown error';
+        if(!navigator.onLine){
+          setStatus('You appear to be offline — reconnect and press Save again.', 'warn');
+          showToast('Offline — not saved', 'warn');
+        }else{
+          setStatus(`Save failed (${detail}) — nothing was stored. Try again; if it repeats, sign out and back in.`, 'warn');
+          showToast('Save failed — not stored', 'warn');
+        }
       }
       ui._saving = false;
-      ui._sessionDirty = false;
       render();
     };
   }
