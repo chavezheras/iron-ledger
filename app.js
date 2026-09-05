@@ -12,7 +12,9 @@ const firebaseConfig = {
 // Paste the Apps Script Web App URL here once deployed (see sheets-export.gs):
 const SHEETS_WEBHOOK_URL = "https://script.google.com/macros/s/AKfycbxlrlRSo06VNDyBSTNmMMJUQGIv0gvycIBZrrw6LHyKCDAtW_HZ9E6DxyH5SaqpywGZdg/exec";
 const ALLOWED_EMAILS = ['chavezheras@gmail.com', 'aramayo.pilar@gmail.com'];
-const SAVE_LIMIT = { count: 3, windowMs: 10 * 60 * 1000 };
+const SAVE_LIMIT = { count: 5, windowMs: 10 * 60 * 1000 };
+const REST_SECONDS = 60;
+const FINISHER_SECONDS = 60;
 // ============================================================
 
 const EXERCISES = [
@@ -22,22 +24,24 @@ const EXERCISES = [
   { id:'press', name:'Single-Arm OH Press', group:2, cue:'Ribs down, press over ear', sets:{pelagio:3,wanix:3}, repRange:[6,10], perSide:true },
   { id:'lunge', name:'Reverse Lunge', group:3, cue:'Back knee light tap, front heel down', sets:{pelagio:2,wanix:4}, repRange:[8,12], perSide:true, swap:true, swapTextPelagio:'Lighter — maintenance only', swapTextWanix:'Extra volume — your focus' },
   { id:'pushup', name:'Push-Up', group:3, cue:'Straight line, elbows ~45°', sets:{pelagio:4,wanix:2}, repRange:[8,15], perSide:false, swap:true, swapTextPelagio:'Extra volume — your focus', swapTextWanix:'Lighter — maintenance only' },
-  { id:'swing', name:'1 min: Swings + Halos', group:4, cue:'Alternate swings with halos (around the world) for one minute', sets:{pelagio:1,wanix:1}, repRange:[0,0], perSide:false, finisher:true, segmentLabels:['SWINGS + HALOS'] }
+  { id:'swing', name:'Swings & Halos', group:4, cue:'One minute of swings, then one minute of halos (around the world).', sets:{pelagio:1,wanix:1}, repRange:[0,0], perSide:false, finisher:true, segmentLabels:['SWINGS','HALOS'] }
 ];
 const GROUP_LABELS = { 1:'Squat + Row', 2:'Hinge + Press', 3:'Your emphasis slot', 4:'Conditioning finisher' };
+const LAST_PAGE = 4;
 const PROFILES = {
-  pelagio: { name:'Pelagio', color:'var(--accent-pelagio)', hex:'#393D7E' },
-  wanix:   { name:'Wanix',   color:'var(--accent-wanix)',  hex:'#F05A7E' }
+  pelagio: { name:'Pelagio', color:'var(--accent-pelagio)', hex:'#393D7E', ink:'#ffffff' },
+  wanix:   { name:'Wanix',   color:'var(--accent-wanix)',  hex:'#F05A7E', ink:'#171827' }
 };
 
-let ui = { profile:'pelagio', tab:'session', workingDate: todayISO(), historyEx: null, _saving:false };
+// ui.page: 0 = welcome, 1-3 = supersets, 4 = finisher
+let ui = { profile:'pelagio', page:0, workingDate: todayISO(), _saving:false, _saveResult:null, _status:'', _statusCls:'' };
+let draft = {}; // { [exId]: { weight:'', reps:['',''] } } — raw string values entered this workout
 let sessionsCache = { pelagio: [], wanix: [] };
 let firestoreReady = false;
 let db = null;
 let auth = null;
 let authReady = false;
 let currentUser = null;
-let restTimerId = null;
 
 function todayISO(){ return new Date().toISOString().slice(0,10); }
 
@@ -88,8 +92,7 @@ function startSessionListener(){
     });
     sessionsCache = next;
     firestoreReady = true;
-    setStatus(navigator.onLine ? '' : 'Offline — logging locally, will sync when back online', navigator.onLine ? '' : 'warn');
-    if(!ui._sessionDirty) render();
+    if(!ui._saving) render();
   }, (err)=>{
     console.error(err);
     setStatus('Sync error — check your Firebase config', 'warn');
@@ -137,35 +140,24 @@ function validNumber(value, min, max){
   return Number.isFinite(value) && value >= min && value <= max;
 }
 
+// ---------- Save throttle (only completed saves count) ----------
 function recentSaveTimes(){
   const now = Date.now();
   let attempts = [];
   try { attempts = JSON.parse(localStorage.getItem('saveAttempts')||'[]'); } catch (error) { attempts = []; }
   return (Array.isArray(attempts) ? attempts : []).filter(time=>now-time<SAVE_LIMIT.windowMs);
 }
-
-// Only a genuine, completed save counts toward the throttle — failed attempts
-// must not lock the user out while they retry.
-function canSave(){
-  if(recentSaveTimes().length >= SAVE_LIMIT.count){
-    setStatus('Save limit reached — please wait a few minutes before saving again.', 'warn');
-    return false;
-  }
-  return true;
-}
-
+function canSave(){ return recentSaveTimes().length < SAVE_LIMIT.count; }
 function recordSave(){
   const recent = recentSaveTimes();
   recent.push(Date.now());
   localStorage.setItem('saveAttempts', JSON.stringify(recent));
 }
 
-function setStatus(msg, cls){
-  ui._status = msg; ui._statusCls = cls || '';
-}
+function setStatus(msg, cls){ ui._status = msg; ui._statusCls = cls || ''; }
 
 window.addEventListener('online', ()=>{ setStatus('', ''); flushSheetsQueue(); render(); });
-window.addEventListener('offline', ()=>{ setStatus('Offline — logging locally, will sync when back online', 'warn'); render(); });
+window.addEventListener('offline', ()=>{ setStatus('Offline — your workout is stored on this phone and will sync later', 'warn'); render(); });
 
 // ---------- Sheets mirror (best-effort, queued) ----------
 function loadQueue(){ try{ return JSON.parse(localStorage.getItem('sheetsRetryQueue')||'[]'); }catch(e){ return []; } }
@@ -210,6 +202,16 @@ function getLastEntry(profile, exId){
   return null;
 }
 
+function daysAgoText(dateStr){
+  if(!dateStr) return '';
+  const then = Date.parse(`${dateStr}T00:00:00`);
+  if(Number.isNaN(then)) return '';
+  const diff = Math.round((Date.now() - then) / 86400000);
+  if(diff <= 0) return 'today';
+  if(diff === 1) return 'yesterday';
+  return `${diff} days ago`;
+}
+
 function progressionBadge(ex, lastEntry){
   if(ex.finisher) return '';
   if(!lastEntry || !lastEntry.reps || !lastEntry.reps.length) return '<span class="badge neutral">first log</span>';
@@ -228,11 +230,81 @@ function weightColor(w){
   return `hsl(${hue}, 55%, 55%)`;
 }
 
+// ---------- Draft (entered values survive navigation, reload, failed saves) ----------
+function slotCount(ex){ return ex.finisher ? ex.segmentLabels.length : ex.sets[ui.profile]; }
+
+function fallbackEntry(exId){
+  const ex = EXERCISES.find(e=>e.id===exId);
+  const todaySession = getSessions(ui.profile).find(s=>s.date===ui.workingDate);
+  const existing = todaySession && todaySession.entries ? todaySession.entries[exId] : null;
+  const last = getLastEntry(ui.profile, exId);
+  const n = slotCount(ex);
+  const weight = existing ? String(existing.weight ?? '')
+    : (last && !ex.finisher && last.weight ? String(last.weight) : '');
+  const reps = Array.from({length:n}, (_,i)=>{
+    if(existing && existing.reps && existing.reps[i] != null) return String(existing.reps[i]);
+    return '';
+  });
+  return { weight, reps };
+}
+
+function seedDraft(){
+  draft = {};
+  EXERCISES.forEach(ex=>{ draft[ex.id] = fallbackEntry(ex.id); });
+  persistWizard();
+}
+
+function draftActive(){ return Object.keys(draft).length > 0; }
+
+function cellValue(exId, field, i){
+  const d = draft[exId] || fallbackEntry(exId);
+  if(field === 'weight') return d.weight ?? '';
+  return (d.reps && d.reps[i] != null) ? d.reps[i] : '';
+}
+
+function syncDraftFromDOM(){
+  document.querySelectorAll('input[data-ex]').forEach(inp=>{
+    const exId = inp.dataset.ex;
+    if(!draft[exId]) draft[exId] = fallbackEntry(exId);
+    if(inp.classList.contains('weight-input')){
+      draft[exId].weight = inp.value;
+    }else if(inp.classList.contains('reps-input')){
+      draft[exId].reps[Number(inp.dataset.set)] = inp.value;
+    }
+  });
+  persistWizard();
+}
+
+function persistWizard(){
+  try{
+    localStorage.setItem('iron-wizard', JSON.stringify({
+      profile: ui.profile, date: ui.workingDate, page: ui.page, draft, savedAt: Date.now()
+    }));
+  }catch(e){ /* storage full / disabled — non-fatal */ }
+}
+
+function restoreWizard(){
+  try{
+    const w = JSON.parse(localStorage.getItem('iron-wizard') || 'null');
+    if(!w) return;
+    if(Date.now() - (w.savedAt || 0) > 18 * 3600 * 1000){ localStorage.removeItem('iron-wizard'); return; }
+    if(w.profile === 'pelagio' || w.profile === 'wanix') ui.profile = w.profile;
+    if(typeof w.date === 'string' && isValidDate(w.date)) ui.workingDate = w.date;
+    if(typeof w.page === 'number' && w.page >= 0 && w.page <= LAST_PAGE) ui.page = w.page;
+    if(w.draft && typeof w.draft === 'object') draft = w.draft;
+  }catch(e){ /* ignore corrupt draft */ }
+}
+
+function clearWizard(){
+  draft = {};
+  try{ localStorage.removeItem('iron-wizard'); }catch(e){}
+}
+
 // ---------- Render ----------
 function render(){
   const app = document.getElementById('app');
   if(!authReady){
-    app.innerHTML = '<main class="auth-panel"><h1>Iron Ledger</h1><p>Connecting securely...</p></main>';
+    app.innerHTML = '<main class="auth-panel"><h1>Iron Ledger</h1><p>Connecting securely…</p></main>';
     return;
   }
   if(!currentUser || !isAllowedUser(currentUser)){
@@ -240,21 +312,19 @@ function render(){
     attachEvents();
     return;
   }
-  const profile = ui.profile;
-  app.style.setProperty('--current-accent', PROFILES[profile].color);
+  app.style.setProperty('--current-accent', PROFILES[ui.profile].color);
 
-  const pendingCount = loadQueue().length;
+  let body;
+  if(ui.page === 0) body = renderWelcome();
+  else if(ui.page >= 1 && ui.page <= 3) body = renderSupersetPage(ui.page);
+  else body = renderFinisherPage();
+
+  const pending = loadQueue().length;
   let statusHtml = '';
-  if(ui._status) statusHtml = escapeHTML(ui._status);
-  else if(pendingCount) statusHtml = `${pendingCount} sheet ${pendingCount===1?'entry':'entries'} waiting to sync`;
-  else statusHtml = 'New workout is being logged — enter your completed sets, then save once.';
+  if(ui._status) statusHtml = `<div class="status-line ${ui._statusCls}">${escapeHTML(ui._status)}</div>`;
+  else if(ui.page === 0 && pending) statusHtml = `<div class="status-line warn">${pending} sheet ${pending===1?'entry':'entries'} waiting to sync</div>`;
 
-  app.innerHTML = `
-    ${renderHeader()}
-    <div class="status-line ${ui._statusCls||(pendingCount?'warn':'')}">${statusHtml}</div>
-    ${renderTabs()}
-    ${ui.tab === 'session' ? renderSession() : renderHistory()}
-  `;
+  app.innerHTML = renderBanner() + statusHtml + body;
   attachEvents();
 }
 
@@ -266,80 +336,158 @@ function kbIconSVG(){
   </svg>`;
 }
 
-function renderHeader(){
+function renderBanner(){
+  const p = PROFILES[ui.profile];
+  const back = ui.page > 0
+    ? `<button class="banner-back" data-action="back" aria-label="Go back">←</button>`
+    : '';
+  const profileChip = ui.page > 0
+    ? `<span class="banner-profile" style="background:${p.color};color:${p.ink}">${p.name}</span>`
+    : '';
   return `
   <header>
-    <div class="brand">
+    <div class="brand ${ui.page > 0 ? 'compact' : ''}">
       ${kbIconSVG()}
       <div><h1>Iron Ledger</h1><small>PELAGIO &amp; WANIX</small></div>
     </div>
-    <div class="profile-toggle">
-      <button data-action="profile" data-profile="pelagio" class="${ui.profile==='pelagio'?'active-pelagio':''}">Pelagio</button>
-      <button data-action="profile" data-profile="wanix" class="${ui.profile==='wanix'?'active-wanix':''}">Wanix</button>
+    <div class="banner-right">
+      ${back}
+      ${profileChip}
+      <button class="sign-out-btn" id="signOutBtn" title="Sign out">Sign out</button>
     </div>
-    <button class="sign-out-btn" id="signOutBtn" title="Sign out">Sign out</button>
   </header>`;
 }
 
-function renderTabs(){
-  return `
-  <div class="tabs">
-    <button data-action="tab" data-tab="session" class="${ui.tab==='session'?'active':''}">Today</button>
-    <button data-action="tab" data-tab="history" class="${ui.tab==='history'?'active':''}">History</button>
-  </div>`;
-}
-
-function romanish(n){ return ['①','②','③','④'][n-1] || n; }
-
-function renderSession(){
+function renderWelcome(){
   const profile = ui.profile;
+  const p = PROFILES[profile];
   const sessions = getSessions(profile);
-  const latestWorkoutDate = getLatestWorkoutDate(profile);
+  const latest = getLatestWorkoutDate(profile);
   const workingDate = ui.workingDate || todayISO();
-  const todaySession = sessions.find(s=>s.date===workingDate);
+  const hasToday = sessions.some(s=>s.date===workingDate);
 
-  let html = `
-    <div class="day-header">
-      <input type="date" class="date-field" id="dateField" value="${escapeHTML(workingDate)}">
-      <span class="session-count">${sessions.length} session${sessions.length===1?'':'s'} logged<br>Latest workout: ${escapeHTML(latestWorkoutDate || 'none yet')}</span>
-    </div>`;
-  [1,2,3,4].forEach(g=>{
-    const restButton = g < 4 ? `<button type="button" class="rest-btn" data-action="rest">Start 1:00 rest</button>` : '';
-    html += `<div class="group-label"><span>${romanish(g)} ${GROUP_LABELS[g]}</span>${restButton}</div>`;
-    EXERCISES.filter(e=>e.group===g).forEach(ex=> html += exerciseCard(ex, profile, todaySession));
-  });
-  html += `
-    <div class="save-bar">
-      <button class="save-btn" id="saveSessionBtn" ${ui._saving?'disabled':''} style="background:${PROFILES[profile].color}">${ui._saving?'Saving workout...':'Save workout'}</button>
+  const stats = !firestoreReady
+    ? `<p class="welcome-stat muted">Loading ${p.name}'s history…</p>`
+    : `<p class="welcome-stat"><b>${sessions.length}</b> session${sessions.length===1?'':'s'} logged</p>
+       <p class="welcome-stat">Last workout: <b>${latest ? `${escapeHTML(latest)}</b> <span class="muted">(${daysAgoText(latest)})</span>` : 'none yet</b>'}</p>`;
+
+  return `
+  <main class="welcome">
+    <h2 class="welcome-title">New workout</h2>
+    <label class="welcome-field">
+      <span>Date</span>
+      <input type="date" id="dateField" class="date-field" value="${escapeHTML(workingDate)}">
+    </label>
+
+    <div class="big-switch" role="group" aria-label="Choose profile">
+      <button data-action="profile" data-profile="pelagio" class="${profile==='pelagio'?'on pelagio':''}">Pelagio</button>
+      <button data-action="profile" data-profile="wanix" class="${profile==='wanix'?'on wanix':''}">Wanix</button>
     </div>
-    <button class="clear-link" id="clearDataBtn">Clear ${PROFILES[profile].name}'s logged sessions</button>`;
-  return html;
+
+    <div class="welcome-card" style="border-color:${p.color}">
+      <h3 style="color:${p.color}">${p.name}</h3>
+      ${stats}
+    </div>
+
+    <button class="wizard-btn" id="startBtn" style="background:${p.color};color:${p.ink}">
+      ${hasToday ? "Continue today's workout" : 'Start a new workout'}
+    </button>
+
+    <button class="clear-link" id="clearDataBtn">Clear ${p.name}'s logged sessions</button>
+  </main>`;
 }
 
-function exerciseCard(ex, profile, todaySession){
-  const setsCount = ex.sets[profile];
+function renderSupersetPage(group){
+  const profile = ui.profile;
+  const exs = EXERCISES.filter(e=>e.group===group);
+  const cards = exs.map(ex=>exerciseCard(ex, profile)).join('');
+  return `
+  <main class="wizard-page">
+    <div class="page-progress">Block ${group} of 3</div>
+    <div class="group-label"><span>${group}. ${GROUP_LABELS[group]}</span></div>
+    ${cards}
+    <div class="wizard-foot">
+      <button class="wizard-btn next" data-action="next" style="background:var(--current-accent)">
+        Next<small>1:00 rest, then next block</small>
+      </button>
+    </div>
+  </main>`;
+}
+
+function renderFinisherPage(){
+  const profile = ui.profile;
+  const ex = EXERCISES.find(e=>e.finisher);
+  return `
+  <main class="wizard-page">
+    <div class="page-progress">Finisher</div>
+    <div class="group-label"><span>4. ${GROUP_LABELS[4]}</span></div>
+    ${exerciseCard(ex, profile)}
+    <div class="finisher-timer">
+      <button class="wizard-btn ghost" data-action="finisher">Start finisher · 2:00</button>
+      <p class="muted small">One minute of swings, then one minute of halos. The rep boxes above are optional.</p>
+    </div>
+    <div class="wizard-foot">
+      <button class="save-btn ${ui._saving?'saving':''}" data-action="save" ${ui._saving?'disabled':''} style="background:var(--current-accent)">
+        ${ui._saving ? 'SAVING…' : 'Save workout'}
+      </button>
+      ${renderSaveResult()}
+    </div>
+  </main>`;
+}
+
+function renderSaveResult(){
+  const r = ui._saveResult;
+  if(!r) return '';
+  if(r.state === 'saved'){
+    return `<div class="save-result saved">WORKOUT SAVED ✓
+      <small>Confirmed on the server. You're done — nice work.</small>
+      <button class="result-btn" data-action="finish">Back to start</button></div>`;
+  }
+  if(r.state === 'local'){
+    return `<div class="save-result local">SAVED ON THIS PHONE ⟳
+      <small>Not confirmed with the server yet — you're offline or on a weak connection. Keep Iron Ledger installed and open it again on Wi-Fi to finish syncing. Your entries are kept here.</small>
+      <button class="result-btn" data-action="save">Try to sync now</button></div>`;
+  }
+  return `<div class="save-result failed">NOT SAVED ✗
+    <small>${escapeHTML(r.message || 'Something went wrong.')} Your entries are kept — press Save workout to try again.</small>
+    <button class="result-btn" data-action="save">Try again</button></div>`;
+}
+
+function exerciseCard(ex, profile){
   const lastEntry = getLastEntry(profile, ex.id);
-  const existing = todaySession && todaySession.entries ? todaySession.entries[ex.id] : null;
-  const prefWeight = existing ? Number(existing.weight)||0 : (lastEntry ? Number(lastEntry.weight)||0 : '');
   const badge = progressionBadge(ex, lastEntry);
-  const swapTag = ex.swap ? `<span class="swap-tag" style="background:${profile==='pelagio'?'var(--accent-pelagio-dim)':'var(--accent-wanix-dim)'};color:${PROFILES[profile].color}">${profile==='pelagio'?ex.swapTextPelagio:ex.swapTextWanix}</span>` : '';
-  const targetText = ex.finisher ? 'Target: 1 min total, alternating swings and halos' : `Target: ${ex.repRange[0]}–${ex.repRange[1]} reps${ex.perSide?'/side':''} × ${setsCount} sets`;
+  const swapTag = ex.swap
+    ? `<span class="swap-tag" style="background:${profile==='pelagio'?'var(--accent-pelagio-dim)':'var(--accent-wanix-dim)'};color:${PROFILES[profile].color}">${profile==='pelagio'?ex.swapTextPelagio:ex.swapTextWanix}</span>`
+    : '';
+  const setsCount = slotCount(ex);
+  const targetText = ex.finisher
+    ? 'Target: 1 min swings, then 1 min halos'
+    : `Target: ${ex.repRange[0]}–${ex.repRange[1]} reps${ex.perSide?'/side':''} × ${setsCount} sets`;
   const lastReps = Array.isArray(lastEntry && lastEntry.reps) ? lastEntry.reps : [];
-  const lastTimeText = lastEntry ? `Last time: ${escapeHTML(lastReps.map(rep=>Number(rep)||0).join(', '))} @ ${escapeHTML(Number(lastEntry.weight)||0)}kg` : 'No previous log yet';
+  const lastTimeText = lastEntry
+    ? `Last time: ${escapeHTML(lastReps.map(rep=>Number(rep)||0).join(', '))}${ex.finisher ? '' : ` @ ${escapeHTML(Number(lastEntry.weight)||0)}kg`}`
+    : 'No previous log yet';
 
   let repsHtml = '';
   if(ex.finisher){
     repsHtml = ex.segmentLabels.map((label, i)=>{
-      const val = existing ? Number(existing.reps[i])||0 : '';
-      return `<div class="set-col"><label>${escapeHTML(label)}<br>1 MIN</label><input type="number" min="0" data-ex="${ex.id}" data-set="${i}" class="reps-input" value="${escapeHTML(val||'')}" style="width:64px"></div>`;
+      const val = cellValue(ex.id, 'reps', i);
+      return `<div class="set-col"><label>${escapeHTML(label)}<br>reps</label><input type="number" inputmode="numeric" min="0" data-ex="${ex.id}" data-set="${i}" class="reps-input" value="${escapeHTML(val)}" style="width:64px"></div>`;
     }).join('');
-  } else {
+  }else{
     for(let i=0;i<setsCount;i++){
-      const val = existing ? Number(existing.reps[i])||0 : '';
-      repsHtml += `<div class="set-col"><label>SET ${i+1}</label><input type="number" min="0" data-ex="${ex.id}" data-set="${i}" class="reps-input" value="${escapeHTML(val||'')}"></div>`;
+      const val = cellValue(ex.id, 'reps', i);
+      repsHtml += `<div class="set-col"><label>SET ${i+1}</label><input type="number" inputmode="numeric" min="0" data-ex="${ex.id}" data-set="${i}" class="reps-input" value="${escapeHTML(val)}"></div>`;
     }
   }
-  const w = prefWeight || 0;
+
+  const w = Number(cellValue(ex.id, 'weight')) || 0;
+  const weightBlock = ex.finisher ? '' : `
+    <div class="weight-wrap">
+      <div class="weight-badge" id="wbadge-${ex.id}" style="background:${weightColor(w)}">${w||'–'}</div>
+      <input type="number" inputmode="decimal" min="0" step="0.5" class="weight-input" data-ex="${ex.id}" id="weight-${ex.id}" value="${escapeHTML(cellValue(ex.id,'weight'))}" placeholder="kg">
+    </div>`;
+
   return `
   <div class="card">
     <div class="card-top">
@@ -352,193 +500,244 @@ function exerciseCard(ex, profile, todaySession){
     </div>
     <div class="last-time">${lastTimeText}</div>
     <div class="input-row">
-      <div class="weight-wrap">
-        <div class="weight-badge" id="wbadge-${ex.id}" style="background:${weightColor(Number(w))}">${w||'–'}</div>
-        <input type="number" min="0" step="0.5" class="weight-input" data-ex="${ex.id}" id="weight-${ex.id}" value="${escapeHTML(prefWeight||'')}" placeholder="kg">
-      </div>
+      ${weightBlock}
       <div class="reps-group">${repsHtml}</div>
     </div>
   </div>`;
 }
 
-function renderHistory(){
-  const profile = ui.profile;
-  const sessions = getSessions(profile);
-  const options = EXERCISES.filter(e=>!e.finisher).map(e=>`<option value="${e.id}">${e.name}</option>`).join('');
-  const chartEx = ui.historyEx || (EXERCISES.find(e=>!e.finisher)||{}).id;
-  const points = [];
-  sessions.forEach(s=>{
-    const entry = s.entries && s.entries[chartEx];
-    const weight = Number(entry && entry.weight);
-    if(Number.isFinite(weight) && weight > 0) points.push({ date:s.date, weight, reps:entry.reps });
-  });
-  const chartHtml = points.length < 2
-    ? `<div class="chart-empty">Log at least 2 sessions with weight for this exercise to see a trend line.</div>`
-    : svgChart(points, profile);
+// ---------- Fullscreen countdown + screen wake lock ----------
+let cd = { raf:0, active:false, wakeLock:null, skip:null };
+let audioCtx = null;
 
-  const progressHtml = EXERCISES.filter(ex=>!ex.finisher).map(ex=>progressCard(ex, getLastEntry(profile, ex.id))).join('');
-
-  let logRows = '';
-  sessions.slice().reverse().slice(0,10).forEach(s=>{
-    const entry = s.entries && s.entries[chartEx];
-    if(!entry) return;
-    const reps = (Array.isArray(entry.reps) ? entry.reps : []).map(rep=>Number(rep)||0).join(', ');
-    logRows += `<div class="log-row"><span class="log-date">${escapeHTML(s.date)}</span><span class="log-reps">${escapeHTML(Number(entry.weight)||0)}kg — ${escapeHTML(reps)}</span></div>`;
-  });
-  if(!logRows) logRows = `<div class="chart-empty">No entries yet for this exercise.</div>`;
-
-  return `
-    <div class="hist-controls"><select id="historyExSelect">${options}</select></div>
-    <div class="progress-grid">${progressHtml}</div>
-    <div class="chart-card">${chartHtml}</div>
-    <div class="chart-card">${logRows}</div>`;
+function primeAudio(){
+  try{
+    audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+    if(audioCtx.state === 'suspended') audioCtx.resume();
+  }catch(e){ audioCtx = null; }
 }
 
-function progressCard(ex, lastEntry){
-  if(!lastEntry || !Array.isArray(lastEntry.reps) || !lastEntry.reps.length){
-    return `<div class="progress-card"><strong>${escapeHTML(ex.name)}</strong><span>No log yet</span></div>`;
+async function acquireWakeLock(){
+  try{
+    if('wakeLock' in navigator){
+      cd.wakeLock = await navigator.wakeLock.request('screen');
+      cd.wakeLock.addEventListener('release', ()=>{ cd.wakeLock = null; });
+    }
+  }catch(e){ cd.wakeLock = null; }
+}
+function releaseWakeLock(){
+  try{ if(cd.wakeLock) cd.wakeLock.release(); }catch(e){}
+  cd.wakeLock = null;
+}
+document.addEventListener('visibilitychange', ()=>{
+  if(cd.active && document.visibilityState === 'visible' && !cd.wakeLock) acquireWakeLock();
+});
+
+function endCue(){
+  try{ if(navigator.vibrate) navigator.vibrate([250, 90, 250]); }catch(e){}
+  try{
+    if(!audioCtx) return;
+    const o = audioCtx.createOscillator();
+    const g = audioCtx.createGain();
+    o.connect(g); g.connect(audioCtx.destination);
+    o.type = 'sine'; o.frequency.value = 880;
+    g.gain.setValueAtTime(0.0001, audioCtx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.2, audioCtx.currentTime + 0.02);
+    g.gain.exponentialRampToValueAtTime(0.0001, audioCtx.currentTime + 0.4);
+    o.start();
+    o.stop(audioCtx.currentTime + 0.4);
+  }catch(e){}
+}
+
+// segments: [{ label, seconds, sub }]
+function runCountdown(segments, onDone){
+  const el = document.getElementById('countdown');
+  const labelEl = document.getElementById('cdLabel');
+  const timeEl = document.getElementById('cdTime');
+  const subEl = document.getElementById('cdSub');
+  cd.active = true;
+  el.hidden = false;
+  document.body.classList.add('cd-open');
+  acquireWakeLock();
+
+  let idx = 0;
+  let endsAt = 0;
+
+  function paint(){
+    const remaining = Math.max(0, endsAt - Date.now());
+    const s = Math.ceil(remaining / 1000);
+    timeEl.textContent = `${Math.floor(s/60)}:${String(s%60).padStart(2,'0')}`;
+    el.classList.toggle('warn', s <= 10 && remaining > 0);
+    if(remaining <= 0){
+      endCue();
+      idx++;
+      startSegment();
+      return;
+    }
+    cd.raf = requestAnimationFrame(paint);
   }
-  const top = ex.repRange[1];
-  const minReps = Math.min(...lastEntry.reps.map(rep=>Number(rep)||0));
-  const percent = Math.min(100, Math.round((minReps/top)*100));
-  const ready = minReps >= top;
-  const label = ready ? 'Ready to increase weight' : `${top-minReps} reps to ceiling`;
-  return `<div class="progress-card"><div class="progress-top"><strong>${escapeHTML(ex.name)}</strong><span>${escapeHTML(Number(lastEntry.weight)||0)} kg</span></div><div class="progress-track"><div class="progress-fill" style="width:${percent}%"></div></div><span class="progress-label">${escapeHTML(label)}</span></div>`;
+
+  function startSegment(){
+    cancelAnimationFrame(cd.raf);
+    if(idx >= segments.length){ finish(); return; }
+    const seg = segments[idx];
+    labelEl.textContent = seg.label;
+    subEl.textContent = seg.sub || (segments.length > 1 ? `${idx+1} of ${segments.length}` : '');
+    endsAt = Date.now() + seg.seconds * 1000;
+    el.classList.remove('warn');
+    paint();
+  }
+
+  function finish(){
+    cancelAnimationFrame(cd.raf);
+    cd.active = false;
+    cd.skip = null;
+    releaseWakeLock();
+    el.hidden = true;
+    el.classList.remove('warn');
+    document.body.classList.remove('cd-open');
+    if(typeof onDone === 'function') onDone();
+  }
+
+  cd.skip = ()=>{ idx++; startSegment(); };
+  startSegment();
 }
 
-function svgChart(points, profile){
-  const w=460, h=140, pad=24;
-  const weights = points.map(p=>p.weight);
-  const minW=Math.min(...weights), maxW=Math.max(...weights);
-  const range=(maxW-minW)||1;
-  const stepX=(w-pad*2)/(points.length-1);
-  const color = PROFILES[profile].hex;
-  const coords = points.map((p,i)=>{
-    const x = pad+i*stepX;
-    const y = h-pad-((p.weight-minW)/range)*(h-pad*2);
-    return {x,y,val:p.weight};
-  });
-  const path = coords.map((c,i)=>(i===0?'M':'L')+c.x.toFixed(1)+','+c.y.toFixed(1)).join(' ');
-  const dots = coords.map(c=>`<circle cx="${c.x.toFixed(1)}" cy="${c.y.toFixed(1)}" r="3.5" fill="${color}"/><text x="${c.x.toFixed(1)}" y="${(c.y-8).toFixed(1)}" font-size="9" fill="var(--text-dim)" text-anchor="middle" font-family="IBM Plex Mono, monospace">${c.val}</text>`).join('');
-  return `<svg viewBox="0 0 ${w} ${h}" width="100%" height="${h}"><path d="${path}" fill="none" stroke="${color}" stroke-width="2"/>${dots}</svg>`;
+// ---------- Save ----------
+function collectEntries(){
+  // Returns { entries, error }. entries: only exercises with data. error: reason string.
+  const entries = {};
+  for(const ex of EXERCISES){
+    const d = draft[ex.id];
+    if(!d) continue;
+    const weight = ex.finisher ? 0 : (Number(d.weight) || 0);
+    const reps = (d.reps || []).map(r=>Number(r) || 0);
+    if(!validNumber(weight, 0, 200)) return { error: 'check-values' };
+    if(reps.length > 10 || reps.some(r=>!validNumber(r, 0, 500))) return { error: 'check-values' };
+    // Only log an exercise the user actually did — a pre-filled weight with no
+    // reps is just the suggested starting load for a block they skipped.
+    if(reps.some(r=>r > 0)) entries[ex.id] = { weight, reps };
+  }
+  if(!Object.keys(entries).length) return { error: 'empty' };
+  return { entries };
+}
+
+const SAVE_MESSAGES = {
+  'permission-denied': "This Google account isn't authorised, or your sign-in expired. Tap Sign out, sign in again, and retry.",
+  'unauthenticated': "You're signed out. Sign in again and retry.",
+  'check-values': 'Some numbers are out of range — weight 0–200 kg, reps 0–500.',
+  'empty': 'Nothing entered yet — add at least one weight or rep count.',
+  'bad-date': 'The workout date looks invalid — go back to the start and pick it again.',
+  'rate-limit': "You've saved several times in a row. Wait a couple of minutes, then try again.",
+  'unavailable': "Couldn't reach the server."
+};
+
+async function saveWorkout(){
+  if(ui._saving) return;
+  syncDraftFromDOM();
+
+  ui._saving = true;
+  ui._saveResult = null;
+  render();
+
+  const startedAt = Date.now();
+  const MIN_VISIBLE_MS = 1600;
+  const finishUp = async (result)=>{
+    const elapsed = Date.now() - startedAt;
+    if(elapsed < MIN_VISIBLE_MS) await new Promise(r=>setTimeout(r, MIN_VISIBLE_MS - elapsed));
+    if(result.state === 'failed' || result.state === 'local') result.message = SAVE_MESSAGES[result.detail] || `Error: ${result.detail}`;
+    ui._saving = false;
+    ui._saveResult = result;
+    if(result.state === 'saved') clearWizard();
+    render();
+  };
+
+  const profile = ui.profile;
+  const date = ui.workingDate;
+
+  if(!db || !currentUser) return finishUp({ state:'failed', detail:'unauthenticated' });
+  if(!isValidDate(date)) return finishUp({ state:'failed', detail:'bad-date' });
+  if(!canSave()) return finishUp({ state:'failed', detail:'rate-limit' });
+
+  const { entries, error } = collectEntries();
+  if(error) return finishUp({ state:'failed', detail:error });
+
+  const docId = `${profile}_${date}`;
+  const ref = db.collection('sessions').doc(docId);
+  const payload = { profile, date, entries, updatedAt: firebase.firestore.FieldValue.serverTimestamp() };
+
+  try{
+    try{
+      await ref.set(payload, { merge:true });
+    }catch(err){
+      if((err.code === 'permission-denied' || err.code === 'unauthenticated') && currentUser && currentUser.getIdToken){
+        // Stale ID token — common right after popup sign-in. Refresh and retry once.
+        try{
+          await currentUser.getIdToken(true);
+          await ref.set(payload, { merge:true });
+        }catch(retryErr){
+          throw (retryErr && retryErr.code) ? retryErr : err;
+        }
+      }else{
+        throw err;
+      }
+    }
+  }catch(err){
+    console.error('Firestore write failed:', err);
+    return finishUp({ state:'failed', detail: err.code || err.message || 'unknown' });
+  }
+
+  // Confirm the write actually reached the server — the only "absolutely saved".
+  let confirmed = false;
+  try{
+    const snap = await ref.get({ source: 'server' });
+    const saved = snap.exists ? (snap.data().entries || {}) : {};
+    confirmed = Object.keys(entries).every(id=>saved[id]);
+  }catch(err){
+    confirmed = false; // offline: the write is queued locally, not on the server
+  }
+
+  if(!confirmed) return finishUp({ state:'local', detail:'unavailable' });
+
+  recordSave();
+  const existingSession = getSessions(profile).find(s=>s.date===date);
+  const mergedEntries = { ...(existingSession && existingSession.entries || {}), ...entries };
+  pushToSheets({ profile, date, entries: mergedEntries });
+  return finishUp({ state:'saved' });
 }
 
 // ---------- Events ----------
 function attachEvents(){
-  document.querySelectorAll('[data-action="profile"]').forEach(btn=>{
-    btn.onclick = ()=>{ ui.profile = btn.dataset.profile; render(); };
-  });
-  document.querySelectorAll('[data-action="tab"]').forEach(btn=>{
-    btn.onclick = ()=>{ ui.tab = btn.dataset.tab; render(); };
-  });
-  const dateField = document.getElementById('dateField');
-  if(dateField) dateField.onchange = ()=>{ ui.workingDate = dateField.value; render(); };
+  const signInBtn = document.getElementById('signInBtn');
+  if(signInBtn){ signInBtn.onclick = signIn; return; }
 
-  document.querySelectorAll('.weight-input').forEach(inp=>{
-    inp.oninput = ()=>{
-      ui._sessionDirty = true;
-      const badge = document.getElementById('wbadge-'+inp.dataset.ex);
-      if(badge){ badge.style.background = weightColor(Number(inp.value)); badge.textContent = inp.value || '–'; }
+  const signOutBtn = document.getElementById('signOutBtn');
+  if(signOutBtn) signOutBtn.onclick = signOut;
+
+  document.querySelectorAll('[data-action="back"]').forEach(btn=>{
+    btn.onclick = ()=>{
+      syncDraftFromDOM();
+      ui.page = Math.max(0, ui.page - 1);
+      ui._saveResult = null;
+      persistWizard();
+      render();
     };
   });
 
-  document.querySelectorAll('.reps-input').forEach(inp=>{
-    inp.oninput = ()=>{ ui._sessionDirty = true; };
+  document.querySelectorAll('[data-action="profile"]').forEach(btn=>{
+    btn.onclick = ()=>{ ui.profile = btn.dataset.profile; persistWizard(); render(); };
   });
 
-  document.querySelectorAll('[data-action="rest"]').forEach(btn=>{
-    btn.textContent = restButtonText();
-    btn.disabled = Boolean(ui._restEndsAt);
-    btn.onclick = ()=>startRestTimer();
-  });
+  const dateField = document.getElementById('dateField');
+  if(dateField) dateField.onchange = ()=>{ ui.workingDate = dateField.value || todayISO(); persistWizard(); render(); };
 
-  const saveBtn = document.getElementById('saveSessionBtn');
-  if(saveBtn){
-    saveBtn.onclick = async ()=>{
-      if(ui._saving) return;
-      if(!db || !currentUser){ setStatus('Sign in before saving a workout.', 'warn'); render(); return; }
-      if(!canSave()) { render(); return; }
-      const profile = ui.profile;
-      const date = (document.getElementById('dateField')||{}).value || todayISO();
-      if(!isValidDate(date)){ setStatus('Choose a valid workout date.', 'warn'); render(); return; }
-      const entries = {};
-      let invalidEntry = false;
-      EXERCISES.forEach(ex=>{
-        const weightEl = document.getElementById('weight-'+ex.id);
-        const weight = weightEl ? Number(weightEl.value)||0 : 0;
-        const repsEls = document.querySelectorAll(`.reps-input[data-ex="${ex.id}"]`);
-        const reps = Array.from(repsEls).map(el=>Number(el.value)||0);
-        if(!validNumber(weight, 0, 200) || reps.length > 10 || reps.some(rep=>!validNumber(rep, 0, 500))){
-          invalidEntry = true;
-          return;
-        }
-        if(weight || reps.some(r=>r>0)) entries[ex.id] = { weight, reps };
-      });
-      if(invalidEntry){
-        setStatus('Use weights from 0–200 kg and reps from 0–500.', 'warn');
-        render();
-        return;
-      }
-      if(!Object.keys(entries).length){
-        setStatus('Nothing to save yet — enter at least one weight or rep count.', 'warn');
-        showToast('Enter a workout before saving', 'warn');
-        render();
-        return;
-      }
-      const docId = `${profile}_${date}`;
-      const existingSession = getSessions(profile).find(session=>session.date===date);
-      const mergedEntries = { ...(existingSession && existingSession.entries || {}), ...entries };
-      // A nested `entries` map with merge:true — Firestore deep-merges nested
-      // maps, so a save only touches the exercises just entered and never
-      // clobbers a concurrent partial save. A flat { 'entries.squat': ... } key
-      // is NOT a field path in set(); it creates a literal "entries.squat"
-      // field, leaving no `entries` map and failing the firestore.rules check.
-      const mergedPayload = { profile, date, entries, updatedAt: firebase.firestore.FieldValue.serverTimestamp() };
-      const writeSession = ()=> db.collection('sessions').doc(docId).set(mergedPayload, { merge:true });
-
-      ui._saving = true;
-      setStatus('Saving workout...', '');
-      render();
-
-      try{
-        // set() only rejects on a real error — offline writes resolve from cache
-        // and sync later. So a rejection here means the write genuinely failed.
-        try{
-          await writeSession();
-        }catch(err){
-          if((err.code === 'permission-denied' || err.code === 'unauthenticated') && currentUser){
-            // Stale ID token — common right after popup sign-in. Refresh and retry once.
-            await currentUser.getIdToken(true);
-            await writeSession();
-          }else{
-            throw err;
-          }
-        }
-        recordSave();
-        ui._sessionDirty = false;
-        const sheetsSynced = await pushToSheets({ profile, date, entries:mergedEntries });
-        if(sheetsSynced){
-          setStatus('Saved and synced!', 'good');
-          showToast('Saved and synced!', 'good');
-        }else if(!navigator.onLine){
-          setStatus('Saved offline — workout will sync when internet is available.', 'warn');
-          showToast('Saved offline — will sync later', 'warn');
-        }else{
-          setStatus('Saved to the database — the Sheet copy will retry shortly.', 'good');
-          showToast('Saved — Sheet copy pending', 'good');
-        }
-      }catch(err){
-        console.error('Workout save failed:', err);
-        const detail = (err && (err.code || err.message)) || 'unknown error';
-        if(!navigator.onLine){
-          setStatus('You appear to be offline — reconnect and press Save again.', 'warn');
-          showToast('Offline — not saved', 'warn');
-        }else{
-          setStatus(`Save failed (${detail}) — nothing was stored. Try again; if it repeats, sign out and back in.`, 'warn');
-          showToast('Save failed — not stored', 'warn');
-        }
-      }
-      ui._saving = false;
+  const startBtn = document.getElementById('startBtn');
+  if(startBtn){
+    startBtn.onclick = ()=>{
+      if(!draftActive()) seedDraft();
+      ui.page = 1;
+      ui._saveResult = null;
+      persistWizard();
       render();
     };
   }
@@ -556,47 +755,53 @@ function attachEvents(){
     };
   }
 
-  const signInBtn = document.getElementById('signInBtn');
-  if(signInBtn) signInBtn.onclick = signIn;
-  const signOutBtn = document.getElementById('signOutBtn');
-  if(signOutBtn) signOutBtn.onclick = signOut;
-
-  const historySelect = document.getElementById('historyExSelect');
-  if(historySelect){
-    historySelect.value = ui.historyEx || historySelect.value;
-    historySelect.onchange = ()=>{ ui.historyEx = historySelect.value; render(); };
-  }
-}
-
-function restButtonText(){
-  if(!ui._restEndsAt) return 'Start 1:00 rest';
-  const remaining = Math.max(0, Math.ceil((ui._restEndsAt-Date.now())/1000));
-  return `Rest ${String(Math.floor(remaining/60)).padStart(2,'0')}:${String(remaining%60).padStart(2,'0')}`;
-}
-
-function updateRestButtons(){
-  document.querySelectorAll('[data-action="rest"]').forEach(btn=>{
-    btn.textContent = restButtonText();
-    btn.disabled = Boolean(ui._restEndsAt);
+  document.querySelectorAll('.weight-input').forEach(inp=>{
+    inp.oninput = ()=>{
+      syncDraftFromDOM();
+      const badge = document.getElementById('wbadge-'+inp.dataset.ex);
+      if(badge){ badge.style.background = weightColor(Number(inp.value)); badge.textContent = inp.value || '–'; }
+    };
   });
-}
+  document.querySelectorAll('.reps-input').forEach(inp=>{
+    inp.oninput = ()=>{ syncDraftFromDOM(); };
+  });
 
-function startRestTimer(){
-  if(ui._restEndsAt) return;
-  ui._restEndsAt = Date.now() + 60 * 1000;
-  updateRestButtons();
-  clearInterval(restTimerId);
-  restTimerId = setInterval(()=>{
-    if(Date.now() >= ui._restEndsAt){
-      ui._restEndsAt = 0;
-      clearInterval(restTimerId);
-      restTimerId = null;
-      updateRestButtons();
-      showToast('Rest complete', 'good');
-      return;
-    }
-    updateRestButtons();
-  }, 250);
+  document.querySelectorAll('[data-action="next"]').forEach(btn=>{
+    btn.onclick = ()=>{
+      primeAudio();
+      syncDraftFromDOM();
+      const goTo = Math.min(LAST_PAGE, ui.page + 1);
+      runCountdown([{ label:'REST', seconds:REST_SECONDS }], ()=>{
+        ui.page = goTo;
+        ui._saveResult = null;
+        persistWizard();
+        render();
+      });
+    };
+  });
+
+  document.querySelectorAll('[data-action="finisher"]').forEach(btn=>{
+    btn.onclick = ()=>{
+      primeAudio();
+      syncDraftFromDOM();
+      runCountdown([
+        { label:'SWINGS', seconds:FINISHER_SECONDS, sub:'1 of 2' },
+        { label:'HALOS', seconds:FINISHER_SECONDS, sub:'2 of 2' }
+      ], ()=>{ showToast('Finisher done', 'good'); });
+    };
+  });
+
+  document.querySelectorAll('[data-action="save"]').forEach(btn=>{ btn.onclick = saveWorkout; });
+
+  document.querySelectorAll('[data-action="finish"]').forEach(btn=>{
+    btn.onclick = ()=>{
+      ui.page = 0;
+      ui._saveResult = null;
+      ui._status = '';
+      persistWizard();
+      render();
+    };
+  });
 }
 
 function showToast(msg, cls){
@@ -608,6 +813,11 @@ function showToast(msg, cls){
   showToast._timer = setTimeout(()=>t.classList.remove('show'), 2200);
 }
 
+// ---------- Boot ----------
+const cdSkipBtn = document.getElementById('cdSkip');
+if(cdSkipBtn) cdSkipBtn.onclick = ()=>{ if(cd.skip) cd.skip(); };
+
+restoreWizard();
 render();
 initFirebase();
 flushSheetsQueue();

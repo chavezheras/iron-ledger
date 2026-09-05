@@ -5,14 +5,13 @@ Iron Ledger is a small offline-first progressive web app for logging kettlebell 
 ## Features
 
 - Separate workout profiles for two people behind Google sign-in
-- Date-based workout sessions
+- Guided workout wizard: welcome/date page, one page per superset, finisher page
 - Exercise weights and reps tracking (fixed 5 month programme)
-- Latest workout date in the session view
-- Save confirmation for synced and offline workouts
-- Protection against empty saves and duplicate save clicks
-- One-minute rest timers between strength supersets
-- One-minute conditioning finisher
-- History view with weight trend charts and recent logs
+- Entered values persist across pages, reloads, and failed saves
+- Three-state save feedback (confirmed on server / saved on phone / not saved) with a large legend
+- Fullscreen high-contrast countdown for the between-block rests and the timed finisher, holding the screen awake
+- Two-part conditioning finisher: one minute of swings, then one minute of halos
+- Protection against out-of-range values and duplicate save clicks
 - Offline app shell and Firestore persistence
 - Installable PWA for phones
 
@@ -80,7 +79,8 @@ Google sign-in must be enabled in Firebase Authentication. Access is restricted 
 | `0.4.0` | Released | Added one-minute rest timers between strength supersets. |
 | `0.5.0` | Released | Reduced the finisher to one minute, changed Pelagio to blue `#393D7E`, changed Wanix to pink `#F05A7E`, improved mobile readability, and added the new icon. |
 | `0.6.0` | Released | Prevented remote saves from clearing active workout forms and preserved existing exercise entries during partial saves. |
-| `0.7.0` | In progress | Added Google sign-in, client and Apps Script validation, save throttling, safe rendering, and progress-to-ceiling cards in History. |
+| `0.7.0` | Released | Added Google sign-in, client and Apps Script validation, save throttling, safe rendering, and progress-to-ceiling cards in History. |
+| `0.8.0` | Released | Fixed the sign-in loop on GitHub Pages (`signInWithPopup`) and the `permission-denied` save failure (nested `entries` map). Rebuilt the logger as a page-per-block wizard with persistent drafts, three-state save confirmation, a fullscreen screen-awake countdown, and a two-part swings/halos finisher. Removed the History view. |
 
 ## License
 
