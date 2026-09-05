@@ -488,8 +488,12 @@ function attachEvents(){
       const docId = `${profile}_${date}`;
       const existingSession = getSessions(profile).find(session=>session.date===date);
       const mergedEntries = { ...(existingSession && existingSession.entries || {}), ...entries };
-      const mergedPayload = { profile, date, updatedAt: firebase.firestore.FieldValue.serverTimestamp() };
-      Object.keys(entries).forEach(exId=>{ mergedPayload[`entries.${exId}`] = entries[exId]; });
+      // A nested `entries` map with merge:true — Firestore deep-merges nested
+      // maps, so a save only touches the exercises just entered and never
+      // clobbers a concurrent partial save. A flat { 'entries.squat': ... } key
+      // is NOT a field path in set(); it creates a literal "entries.squat"
+      // field, leaving no `entries` map and failing the firestore.rules check.
+      const mergedPayload = { profile, date, entries, updatedAt: firebase.firestore.FieldValue.serverTimestamp() };
       const writeSession = ()=> db.collection('sessions').doc(docId).set(mergedPayload, { merge:true });
 
       ui._saving = true;
